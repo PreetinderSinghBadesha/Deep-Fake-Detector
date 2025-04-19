@@ -1,595 +1,835 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+DeepFake Detection Model using EfficientNetB0
+---------------------------------------------
+This script implements a deep learning model for detecting deepfake videos
+using the Celeb-DF dataset. It includes data preprocessing, model training,
+and evaluation.
+
+Author: DeepFake Detector Team
+Date: April 2025
+"""
+
 import os
+import sys
 import cv2
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, applications, regularizers
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
 import matplotlib.pyplot as plt
-from mtcnn import MTCNN
-import glob
 from tqdm import tqdm
-from sklearn.utils import class_weight
-import time
+from mtcnn import MTCNN
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+import albumentations as A
+from tensorflow.keras.applications import EfficientNetB0, EfficientNetB4
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input, BatchNormalization, Conv2D, MaxPooling2D, Flatten
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+import tensorflow_addons as tfa
 
-# Configuration for the GPU
-print("Checking for GPU availability...")
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Currently, memory growth needs to be the same across GPUs
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-        print(f"✅ GPU detected: {len(gpus)} Physical GPUs, {len(logical_gpus)} Logical GPUs")
-        print(f"GPU Details:")
-        if hasattr(tf.sysconfig, 'get_build_info'):
-            build_info = tf.sysconfig.get_build_info()
-            if 'cuda_version' in build_info:
-                print(f"  CUDA Version: {build_info['cuda_version']}")
-            if 'cudnn_version' in build_info:
-                print(f"  CUDNN Version: {build_info['cudnn_version']}")
-        print(f"  TensorFlow GPU Support: {tf.test.is_built_with_cuda()}")
-        print(f"  Is TensorFlow using GPU: {tf.test.is_gpu_available()}")
-        
-        # Run a quick test operation on GPU
-        with tf.device('/GPU:0'):
-            a = tf.constant([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-            b = tf.constant([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-            c = tf.matmul(a, b)
-            print(f"  Test GPU computation result: {c.numpy().sum()}")
-            print("  GPU is working correctly!")
-    except RuntimeError as e:
-        print(f"❌ GPU Error: {e}")
-else:
-    print("❌ No GPU found. Using CPU instead.")
-    print("\nTroubleshooting tips:")
-    print("1. Verify NVIDIA drivers are installed with 'nvidia-smi'")
-    print("2. Check TensorFlow GPU support with 'pip list | findstr tensorflow'")
-    print("3. Install GPU support with 'pip install tensorflow[and-cuda]'")
-    print("4. Make sure to restart Python after installing GPU packages")
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
 
 # Parameters
-IMAGE_SIZE = 224  # Increased from 128 to 224 for more detail
-BATCH_SIZE = 32
-EPOCHS = 30  # Increased from 20 to 30
-MARGIN_PERCENT = 0.3  # 30% margin for face crop
+FACE_SIZE = 224  # Increased face size for better feature extraction
+BATCH_SIZE = 16  # Reduced batch size to improve gradient updates
+EPOCHS = 50      # Increased maximum number of training epochs
+LEARNING_RATE = 0.0001  # Initial learning rate
+VALIDATION_SPLIT = 0.15  # Slightly reduced validation split
+TEST_SPLIT = 0.15        # Increased test split for better evaluation
+USE_CLASS_WEIGHTS = True  # Use class weights to handle imbalance
+USE_MIXED_PRECISION = True  # Use mixed precision training
+MODEL_SAVE_PATH = "deepfake_detector_model.h5"
+FINE_TUNED_MODEL_SAVE_PATH = "deepfake_detector_model_fine_tuned.h5"
+BEST_MODEL_SAVE_PATH = "deepfake_detector_best_model.h5"
 
-# Create a face detector
-detector = MTCNN()
+# Path to the Celeb-DF dataset
+DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Celeb-DF")
 
-def extract_face(image_path, required_size=(IMAGE_SIZE, IMAGE_SIZE), margin_percent=MARGIN_PERCENT):
+# Enable mixed precision if requested
+if USE_MIXED_PRECISION:
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    print("Mixed precision enabled")
+
+def create_face_extraction_pipeline():
     """
-    Extract face from an image with a margin around it
+    Create a face extraction pipeline using MTCNN
+    
+    Returns:
+        face_detector: An MTCNN detector
     """
-    try:
-        # Load image
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
+    # Initialize the face detector
+    face_detector = MTCNN()
+    return face_detector
+
+def extract_face(image, face_detector, required_size=(FACE_SIZE, FACE_SIZE)):
+    """
+    Extract a face from an image using MTCNN
+    
+    Args:
+        image: The input image
+        face_detector: MTCNN detector
+        required_size: Size to resize the face to
         
-        # Convert to RGB (MTCNN expects RGB)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    Returns:
+        face_array: Extracted and processed face, or None if no face detected
+    """
+    # Convert to RGB if needed
+    if image.ndim == 2:  # Grayscale
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] == 4:  # RGBA
+        image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+    
+    # Detect faces in the image
+    results = face_detector.detect_faces(image)
+    
+    # If no faces detected, return None
+    if not results or len(results) == 0:
+        return None
+    
+    # Get the largest face by area (width*height)
+    largest_face = max(results, key=lambda x: x['box'][2] * x['box'][3])
+    
+    # Extract the face
+    x1, y1, width, height = largest_face['box']
+    x2, y2 = x1 + width, y1 + height
+    
+    # Apply margin (30% as suggested by many deepfake detection papers)
+    margin_x = int(width * 0.3)
+    margin_y = int(height * 0.3)
+    
+    # Apply margins safely (ensure we don't go out of the image bounds)
+    x1 = max(0, x1 - margin_x)
+    y1 = max(0, y1 - margin_y)
+    x2 = min(image.shape[1], x2 + margin_x)
+    y2 = min(image.shape[0], y2 + margin_y)
+    
+    # Extract the face from the image
+    face = image[y1:y2, x1:x2]
+    
+    # Resize the face to the required size
+    face = cv2.resize(face, required_size)
+    
+    return face
+
+def process_video_file(video_path, face_detector, max_frames=30):
+    """
+    Process a video file to extract faces from frames
+    
+    Args:
+        video_path: Path to the video file
+        face_detector: MTCNN detector
+        max_frames: Maximum number of frames to process
         
-        # Detect faces
-        faces = detector.detect_faces(img)
-        if not faces:
-            # If no face detected, resize the whole image
-            return cv2.resize(img, required_size)
+    Returns:
+        faces: List of extracted faces
+    """
+    # Open the video file
+    video = cv2.VideoCapture(video_path)
+    
+    # Check if the video was opened successfully
+    if not video.isOpened():
+        print(f"Error opening video file {video_path}")
+        return []
+    
+    # Get video properties
+    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = video.get(cv2.CAP_PROP_FPS)
+    duration = frame_count / fps
+    
+    # Calculate frames to extract (evenly distributed)
+    frames_to_extract = min(max_frames, frame_count)
+    if frames_to_extract < 1:
+        return []
+    
+    # Calculate frame intervals
+    interval = frame_count / frames_to_extract
+    frame_indices = [int(i * interval) for i in range(frames_to_extract)]
+    
+    faces = []
+    for idx in frame_indices:
+        # Set video to the specific frame
+        video.set(cv2.CAP_PROP_POS_FRAMES, idx)
         
-        # Get the largest face
-        face = max(faces, key=lambda x: x['box'][2] * x['box'][3])
-        x, y, width, height = face['box']
+        # Read the frame
+        success, frame = video.read()
         
-        # Calculate margins
-        margin_x = int(width * margin_percent)
-        margin_y = int(height * margin_percent)
+        if not success:
+            continue
         
-        # Apply margins to the bounding box
-        x = max(0, x - margin_x)
-        y = max(0, y - margin_y)
-        width = min(img.shape[1] - x, width + 2 * margin_x)
-        height = min(img.shape[0] - y, height + 2 * margin_y)
+        # Convert the frame from BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         # Extract the face
-        face_img = img[y:y+height, x:x+width]
+        face = extract_face(frame_rgb, face_detector)
         
-        # Resize to the required size
-        face_img = cv2.resize(face_img, required_size)
+        if face is not None:
+            faces.append(face)
+    
+    # Release the video file
+    video.release()
+    
+    return faces
+
+def load_dataset(test_list_path=None):
+    """
+    Load the Celeb-DF dataset from the provided path
+    
+    Args:
+        test_list_path: Path to the test list file
         
-        return face_img
-    except Exception as e:
-        print(f"Error processing {image_path}: {str(e)}")
-        return None
+    Returns:
+        videos_data: DataFrame containing video paths and labels
+    """
+    if test_list_path is None:
+        test_list_path = os.path.join(DATASET_PATH, "List_of_testing_videos.txt")
+    
+    # Check if the test list file exists
+    if not os.path.exists(test_list_path):
+        raise FileNotFoundError(f"Test list file not found: {test_list_path}")
+    
+    # Read the test list file
+    with open(test_list_path, 'r') as f:
+        lines = f.readlines()
+    
+    # Parse the lines to extract labels and video paths
+    videos_data = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            label = int(parts[0])
+            video_path = os.path.join(DATASET_PATH, parts[1])
+            if os.path.exists(video_path):
+                videos_data.append({
+                    'path': video_path,
+                    'label': label
+                })
+    
+    # Convert to DataFrame
+    videos_df = pd.DataFrame(videos_data)
+    
+    print(f"Loaded {len(videos_df)} videos")
+    
+    # Print class distribution
+    class_counts = videos_df['label'].value_counts()
+    print(f"Class distribution: {class_counts.to_dict()}")
+    
+    return videos_df
 
-def load_dataset(metadata_path, dataset_dir):
+def create_train_val_test_split(videos_df):
     """
-    Load dataset from metadata and apply preprocessing
-    """
-    # Load metadata
-    print("Loading metadata file...")
-    # Get file size for progress bar
-    file_size = os.path.getsize(metadata_path)
-    chunk_size = 1024 * 1024  # 1MB chunks
-    chunks = file_size // chunk_size + 1
+    Split the dataset into training, validation, and test sets
     
-    # Create progress bar for loading metadata
-    with open(metadata_path, 'r') as f:
-        pbar = tqdm(total=chunks, desc="Loading metadata", unit="MB")
-        chunks_read = 0
-        for _ in pd.read_csv(metadata_path, chunksize=100000):
-            chunks_read += 1
-            if chunks_read <= chunks:
-                pbar.update(1)
-        pbar.close()
-    
-    metadata = pd.read_csv(metadata_path)
-    print(f"Metadata loaded successfully with {len(metadata)} entries")
-    
-    X_real = []
-    X_fake = []
-    
-    # Process real videos
-    real_files = metadata[metadata['label'] == 'REAL']['filename'].tolist()
-    print(f"Processing {len(real_files)} real videos...")
-    
-    real_count = 0
-    progress_bar_real = tqdm(total=len(real_files), desc="Processing real videos", unit="video")
-    for filename in real_files:
-        # Get the directory name (without the file extension)
-        dir_name = os.path.splitext(filename)[0]
-        dir_path = os.path.join(dataset_dir, dir_name)
+    Args:
+        videos_df: DataFrame containing video paths and labels
         
-        # Get all frame images from the directory (supporting both jpg and png)
-        if os.path.exists(dir_path):
-            # Look for both .jpg and .png files
-            jpg_files = glob.glob(os.path.join(dir_path, "*.jpg"))
-            png_files = glob.glob(os.path.join(dir_path, "*.png"))
-            image_files = jpg_files + png_files
-            
-            if not image_files:
-                progress_bar_real.update(1)
-                continue
-                
-            # Take only a subset of frames to avoid memory issues
-            for img_path in image_files[:10]:  # Process up to 10 frames per video
-                face_img = extract_face(img_path)
-                if face_img is not None:
-                    X_real.append(face_img)
-                    real_count += 1
-            
-            progress_bar_real.update(1)
-    
-    progress_bar_real.close()
-    print(f"Processed {real_count} real frames from {len(real_files)} videos")
-    
-    # Process fake videos
-    fake_files = metadata[metadata['label'] == 'FAKE']['filename'].tolist()
-    print(f"Processing {len(fake_files)} fake videos...")
-    
-    fake_count = 0
-    progress_bar_fake = tqdm(total=len(fake_files), desc="Processing fake videos", unit="video")
-    for filename in fake_files:
-        dir_name = os.path.splitext(filename)[0]
-        dir_path = os.path.join(dataset_dir, dir_name)
-        
-        if os.path.exists(dir_path):
-            # Look for both .jpg and .png files
-            jpg_files = glob.glob(os.path.join(dir_path, "*.jpg"))
-            png_files = glob.glob(os.path.join(dir_path, "*.png"))
-            image_files = jpg_files + png_files
-            
-            if not image_files:
-                progress_bar_fake.update(1)
-                continue
-                
-            for img_path in image_files[:10]:  # Process up to 10 frames per video
-                face_img = extract_face(img_path)
-                if face_img is not None:
-                    X_fake.append(face_img)
-                    fake_count += 1
-            
-            progress_bar_fake.update(1)
-    
-    progress_bar_fake.close()
-    print(f"Processed {fake_count} fake frames from {len(fake_files)} videos")
-    
-    print(f"Successfully loaded {len(X_real)} real frames and {len(X_fake)} fake frames.")
-    
-    # Check if we have any data
-    if len(X_real) == 0 and len(X_fake) == 0:
-        raise ValueError("Failed to load any valid images. Please check your dataset directories and image files.")
-    
-    # Handle the case where only one class has data
-    if len(X_real) == 0:
-        print("WARNING: No real frames loaded. Check your dataset paths.")
-    if len(X_fake) == 0:
-        print("WARNING: No fake frames loaded. Check your dataset paths.")
-    
-    # Create labels
-    y_real = np.ones(len(X_real))
-    y_fake = np.zeros(len(X_fake))
-    
-    # Combine data
-    X = np.array(X_real + X_fake)
-    y = np.concatenate([y_real, y_fake])
-    
-    # Normalize pixel values
-    X = X.astype('float32') / 255.0
-    
-    print(f"Final dataset shape: X: {X.shape}, y: {y.shape}")
-    return X, y
-
-def create_data_augmentation():
+    Returns:
+        train_df, val_df, test_df: DataFrames for training, validation, and test sets
     """
-    Create enhanced data augmentation pipeline for better generalization
-    """
-    return keras.Sequential([
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.2),  # Increased rotation range
-        layers.RandomBrightness(0.2),  # Increased brightness range
-        layers.RandomContrast(0.2),  # Increased contrast range
-        layers.RandomZoom(0.2),  # Added random zoom
-        layers.RandomTranslation(0.1, 0.1),  # Added random translation
-        layers.GaussianNoise(0.01),  # Added noise for robustness
-    ])
-
-def attention_module(x):
-    """
-    Simple self-attention mechanism to focus on important features
-    """
-    # Channel attention
-    avg_pool = layers.GlobalAveragePooling2D()(x)
-    avg_pool = layers.Reshape((1, 1, avg_pool.shape[-1]))(avg_pool)
-    avg_pool = layers.Conv2D(filters=x.shape[-1] // 8, kernel_size=1, activation='relu')(avg_pool)
-    avg_pool = layers.Conv2D(filters=x.shape[-1], kernel_size=1, activation='sigmoid')(avg_pool)
-    
-    # Spatial attention
-    max_pool = layers.GlobalMaxPooling2D()(x)
-    max_pool = layers.Reshape((1, 1, max_pool.shape[-1]))(max_pool)
-    max_pool = layers.Conv2D(filters=x.shape[-1] // 8, kernel_size=1, activation='relu')(max_pool)
-    max_pool = layers.Conv2D(filters=x.shape[-1], kernel_size=1, activation='sigmoid')(max_pool)
-    
-    # Combine attentions
-    attention = layers.Add()([avg_pool, max_pool])
-    
-    # Apply attention
-    return layers.Multiply()([x, attention])
-
-def build_model():
-    """
-    Build an improved deepfake detection model with EfficientNetB3 base
-    """
-    # Load the EfficientNetB3 model (upgraded from B0)
-    base_model = applications.EfficientNetB3(
-        weights='imagenet',
-        input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
-        include_top=False
+    # First split to get the test set
+    train_val_df, test_df = train_test_split(
+        videos_df,
+        test_size=TEST_SPLIT,
+        random_state=42,
+        stratify=videos_df['label']
     )
     
-    # Freeze the base model initially
-    base_model.trainable = False
+    # Split the remaining data into training and validation
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=VALIDATION_SPLIT / (1 - TEST_SPLIT),
+        random_state=42,
+        stratify=train_val_df['label']
+    )
     
-    # Create the improved model
-    inputs = keras.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3))
+    print(f"Training set: {len(train_df)} videos")
+    print(f"Validation set: {len(val_df)} videos")
+    print(f"Test set: {len(test_df)} videos")
     
-    # Data augmentation during training only
-    augmented = create_data_augmentation()(inputs)
+    return train_df, val_df, test_df
+
+def process_videos_and_extract_faces(videos_df, face_detector, max_frames=20):
+    """
+    Process videos and extract faces
     
-    # Pre-trained base model
-    x = base_model(augmented, training=False)
+    Args:
+        videos_df: DataFrame containing video paths and labels
+        face_detector: MTCNN detector
+        max_frames: Maximum number of frames to process per video
+        
+    Returns:
+        X: List of face images
+        y: List of labels
+        video_indices: List of indices linking faces to videos
+    """
+    print("Extracting faces from videos...")
+    X = []
+    y = []
+    video_indices = []
     
-    # Add attention mechanism to focus on important features
-    x = attention_module(x)
+    for idx, row in tqdm(videos_df.iterrows(), total=len(videos_df)):
+        video_path = row['path']
+        label = row['label']
+        
+        # Process the video file
+        faces = process_video_file(video_path, face_detector, max_frames)
+        
+        # Add faces to the dataset
+        for face in faces:
+            X.append(face)
+            y.append(label)
+            video_indices.append(idx)
     
-    # Global pooling with concatenated max and average pooling for better feature representation
-    avg_pool = layers.GlobalAveragePooling2D()(x)
-    max_pool = layers.GlobalMaxPooling2D()(x)
-    pooled = layers.Concatenate()([avg_pool, max_pool])
+    print(f"Extracted {len(X)} faces from {len(videos_df)} videos")
     
-    # Dropout for regularization
-    x = layers.Dropout(0.5)(pooled)
+    return np.array(X), np.array(y), np.array(video_indices)
+
+def create_data_augmentation_pipeline():
+    """
+    Create enhanced data augmentation pipeline for training
     
-    # First dense layer with regularization
-    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(1e-4))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.4)(x)
+    Returns:
+        augmentation: Albumentations augmentation pipeline
+    """
+    augmentation = A.Compose([
+        # Color transformations
+        A.OneOf([
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.8),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=40, val_shift_limit=30, p=0.8),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.8),
+        ], p=0.9),
+        
+        # Noise and blur
+        A.OneOf([
+            A.GaussNoise(var_limit=(10.0, 80.0), p=0.6),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.6),
+            A.MotionBlur(blur_limit=(3, 7), p=0.6),
+            A.MedianBlur(blur_limit=5, p=0.5),
+        ], p=0.7),
+        
+        # Image quality degradation (common in deepfakes)
+        A.OneOf([
+            A.ImageCompression(quality_lower=65, quality_upper=100, p=0.7),
+            A.Downscale(scale_min=0.7, scale_max=0.99, p=0.6),
+        ], p=0.7),
+        
+        # Geometric transformations
+        A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.15, rotate_limit=20, border_mode=cv2.BORDER_CONSTANT, p=0.7),
+        A.HorizontalFlip(p=0.5),
+        
+        # Cutouts and grid distortions to help model focus on different facial regions
+        A.OneOf([
+            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+            A.CoarseDropout(max_holes=8, max_height=16, max_width=16, min_holes=2, min_height=8, min_width=8, p=0.5),
+        ], p=0.5),
+    ])
     
-    # Second dense layer
-    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(1e-4))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.3)(x)
+    return augmentation
+
+class DataGenerator(tf.keras.utils.Sequence):
+    """
+    Data generator for training and validation
+    """
+    def __init__(self, X, y, batch_size=32, augment=False, shuffle=True):
+        """
+        Initialize the generator
+        
+        Args:
+            X: List of face images
+            y: List of labels
+            batch_size: Batch size
+            augment: Whether to use data augmentation
+            shuffle: Whether to shuffle the data
+        """
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.augment = augment
+        self.shuffle = shuffle
+        self.augmentation = create_data_augmentation_pipeline() if augment else None
+        self.indices = np.arange(len(self.X))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
     
-    # Output layer with sigmoid activation
-    outputs = layers.Dense(1, activation='sigmoid')(x)
+    def __len__(self):
+        """
+        Return the number of batches
+        """
+        return int(np.ceil(len(self.X) / self.batch_size))
+    
+    def __getitem__(self, idx):
+        """
+        Return a batch of data
+        """
+        # Get a batch of indices
+        inds = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+        
+        # Get the data for this batch
+        batch_X = self.X[inds]
+        batch_y = self.y[inds]
+        
+        # Apply augmentation if needed
+        if self.augment:
+            aug_batch_X = np.zeros_like(batch_X)
+            for i, img in enumerate(batch_X):
+                augmented = self.augmentation(image=img)
+                aug_batch_X[i] = augmented['image']
+            batch_X = aug_batch_X
+        
+        # Normalize pixel values between 0 and 1
+        batch_X = batch_X.astype('float32') / 255.0
+        
+        return batch_X, batch_y
+    
+    def on_epoch_end(self):
+        """
+        Called at the end of each epoch
+        """
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+def create_deepfake_detector_model(freeze_base=True):
+    """
+    Create a deepfake detector model based on EfficientNetB4 (upgraded from B0)
+    
+    Args:
+        freeze_base: Whether to freeze the base model weights
+        
+    Returns:
+        model: The created model
+    """
+    # Input layer
+    inputs = Input(shape=(FACE_SIZE, FACE_SIZE, 3))
+    
+    # Load EfficientNetB4 pre-trained on ImageNet (without top layers)
+    base_model = EfficientNetB4(
+        weights='imagenet',
+        include_top=False,
+        input_tensor=inputs
+    )
+    
+    # Freeze the base model if requested
+    if freeze_base:
+        for layer in base_model.layers:
+            layer.trainable = False
+    
+    # Add custom top layers with improved architecture
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+    
+    # Additional dense layers with batch normalization
+    x = Dense(512, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+    
+    outputs = Dense(1, activation='sigmoid', name='output')(x)
     
     # Create the model
-    model = keras.Model(inputs=inputs, outputs=outputs)
-    
-    # Compile the model
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=[
-            'accuracy',
-            keras.metrics.AUC(name='auc'),
-            keras.metrics.Precision(name='precision'),
-            keras.metrics.Recall(name='recall')
-        ]
-    )
+    model = Model(inputs=inputs, outputs=outputs)
     
     return model
 
-def main():
-    # Define file paths
-    metadata_path = os.path.join("dataset", "metadata.csv")
-    dataset_dir = "dataset"
+def compile_model(model, learning_rate=LEARNING_RATE):
+    """
+    Compile the model
     
-    # Check if metadata exists
-    if not os.path.exists(metadata_path):
-        print(f"Metadata file not found: {metadata_path}")
-        return
+    Args:
+        model: The model to compile
+        learning_rate: Learning rate
+    """
+    # F1 score and AUC metrics
+    f1 = tfa.metrics.F1Score(num_classes=1, threshold=0.5)
+    auc = tf.keras.metrics.AUC()
     
-    # Load and preprocess the dataset
-    print("Loading and preprocessing dataset...")
-    try:
-        X, y = load_dataset(metadata_path, dataset_dir)
-        print(f"Dataset loaded. Shape: {X.shape}, Labels shape: {y.shape}")
+    # Compile the model with improved optimizer settings
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate),
+        loss='binary_crossentropy',
+        metrics=['accuracy', f1, auc, 'precision', 'recall']
+    )
+
+def train_model(
+    X_train, y_train, X_val, y_val,
+    batch_size=BATCH_SIZE, epochs=EPOCHS, freeze_base=True
+):
+    """
+    Train the deepfake detector model
+    
+    Args:
+        X_train, y_train: Training data
+        X_val, y_val: Validation data
+        batch_size: Batch size
+        epochs: Number of epochs
+        freeze_base: Whether to freeze the base model weights
         
-        # Split the dataset into train, validation, and test sets
-        X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.25, random_state=42, stratify=y_train_val)
-        
-        print(f"Train set: {X_train.shape}, Validation set: {X_val.shape}, Test set: {X_test.shape}")
-        
-        # Calculate class weights to handle imbalance
-        class_weights = class_weight.compute_class_weight(
-            'balanced',
-            classes=np.unique(y_train),
-            y=y_train
-        )
-        class_weight_dict = dict(enumerate(class_weights))
+    Returns:
+        model: The trained model
+        history: Training history
+    """
+    # Create data generators
+    train_gen = DataGenerator(X_train, y_train, batch_size=batch_size, augment=True, shuffle=True)
+    val_gen = DataGenerator(X_val, y_val, batch_size=batch_size, augment=False, shuffle=False)
+    
+    # Calculate class weights if needed
+    class_weights = None
+    if USE_CLASS_WEIGHTS:
+        class_counts = np.bincount(y_train.astype(int))
+        total = np.sum(class_counts)
+        class_weight_dict = {
+            0: total / (class_counts[0] * 2),
+            1: total / (class_counts[1] * 2)
+        }
         print(f"Class weights: {class_weight_dict}")
-        
-        # Build the model
-        print("Building improved model...")
-        model = build_model()
-        model.summary()
-        
-        # Define callbacks for better training
-        early_stopping = EarlyStopping(
-            monitor='val_auc',  # Monitor AUC instead of just loss
-            mode='max',
-            patience=7,  # Increased patience
+        class_weights = class_weight_dict
+    
+    # Create the model
+    model = create_deepfake_detector_model(freeze_base=freeze_base)
+    
+    # Compile the model
+    compile_model(model, learning_rate=LEARNING_RATE)
+    
+    # Print model summary
+    model.summary()
+    
+    # Create callbacks
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=5,
             restore_best_weights=True,
             verbose=1
-        )
-        
-        reduce_lr = ReduceLROnPlateau(
-            monitor='val_auc',
-            mode='max',
-            factor=0.2,
-            patience=5,
-            min_lr=0.00001,
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
             verbose=1
-        )
-        
-        # Add model checkpoint to save best model during training
-        model_checkpoint = ModelCheckpoint(
-            'deepfake_detector_best_model.h5',
-            monitor='val_auc',
-            mode='max',
+        ),
+        ModelCheckpoint(
+            BEST_MODEL_SAVE_PATH,
+            monitor='val_loss',
             save_best_only=True,
             verbose=1
         )
+    ]
+    
+    # Train the model
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=epochs,
+        callbacks=callbacks,
+        class_weight=class_weights,
+        verbose=1
+    )
+    
+    return model, history
+
+def fine_tune_model(model, X_train, y_train, X_val, y_val, batch_size=BATCH_SIZE, epochs=EPOCHS//2):
+    """
+    Fine-tune the pre-trained model by unfreezing some layers
+    
+    Args:
+        model: The pre-trained model
+        X_train, y_train: Training data
+        X_val, y_val: Validation data
+        batch_size: Batch size
+        epochs: Number of epochs
         
-        # Train the model with more metrics tracking
-        print("Training improved model...")
-        start_time = time.time()
-        history = model.fit(
-            X_train,
-            y_train,
-            batch_size=BATCH_SIZE,
-            epochs=EPOCHS,
-            validation_data=(X_val, y_val),
-            callbacks=[early_stopping, reduce_lr, model_checkpoint],
-            class_weight=class_weight_dict  # Added class weights to handle imbalance
+    Returns:
+        model: The fine-tuned model
+        history: Training history
+    """
+    # Unfreeze more layers of the base model for better fine-tuning
+    for layer in model.layers:
+        if hasattr(layer, 'layers'):  # Check if it's the base model
+            for i, base_layer in enumerate(layer.layers):
+                if i >= len(layer.layers) - 50:  # Unfreeze last 50 layers (increased from 20)
+                    base_layer.trainable = True
+    
+    # Compile the model with a lower learning rate
+    compile_model(model, learning_rate=LEARNING_RATE / 20.0)
+    
+    # Print the fine-tuning model summary
+    model.summary()
+    
+    # Create data generators
+    train_gen = DataGenerator(X_train, y_train, batch_size=batch_size, augment=True, shuffle=True)
+    val_gen = DataGenerator(X_val, y_val, batch_size=batch_size, augment=False, shuffle=False)
+    
+    # Calculate class weights if needed
+    class_weights = None
+    if USE_CLASS_WEIGHTS:
+        class_counts = np.bincount(y_train.astype(int))
+        total = np.sum(class_counts)
+        # Improved class weights calculation to address class imbalance better
+        class_weight_dict = {
+            0: total / (class_counts[0] * 2.0),
+            1: total / (class_counts[1] * 2.0)
+        }
+        class_weights = class_weight_dict
+    
+    # Create callbacks with improved patience settings
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=10,  # Increased patience
+            restore_best_weights=True,
+            verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.3,  # More aggressive LR reduction
+            patience=5,   # Increased patience
+            min_lr=1e-8,  # Lower minimum LR
+            verbose=1
+        ),
+        ModelCheckpoint(
+            BEST_MODEL_SAVE_PATH,
+            monitor='val_loss',
+            save_best_only=True,
+            verbose=1
         )
-        training_time = time.time() - start_time
-        print(f"Model training completed in {training_time:.2f} seconds")
+    ]
+    
+    # Fine-tune the model with more epochs
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=epochs,
+        callbacks=callbacks,
+        class_weight=class_weights,
+        verbose=1
+    )
+    
+    return model, history
+
+def evaluate_model(model, X_test, y_test, threshold=0.5):
+    """
+    Evaluate the model on the test set
+    
+    Args:
+        model: The model to evaluate
+        X_test, y_test: Test data
+        threshold: Classification threshold
         
-        # Evaluate the model with more metrics
-        print("Evaluating improved model on test set...")
-        y_pred_prob = model.predict(X_test)
-        y_pred = (y_pred_prob > 0.5).astype(int).flatten()
+    Returns:
+        metrics: Dictionary of evaluation metrics
+    """
+    # Create a test generator
+    test_gen = DataGenerator(X_test, y_test, batch_size=BATCH_SIZE, augment=False, shuffle=False)
+    
+    # Predict on the test set
+    y_pred_prob = model.predict(test_gen)
+    y_pred = (y_pred_prob > threshold).astype(int)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_pred_prob)
+    
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    
+    # Store metrics
+    metrics = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'auc': auc,
+        'confusion_matrix': cm
+    }
+    
+    # Print metrics
+    print(f"Test Accuracy: {accuracy:.4f}")
+    print(f"Test Precision: {precision:.4f}")
+    print(f"Test Recall: {recall:.4f}")
+    print(f"Test F1 Score: {f1:.4f}")
+    print(f"Test AUC: {auc:.4f}")
+    print(f"Confusion Matrix:\n{cm}")
+    
+    # Find optimal threshold
+    if len(y_pred_prob) > 0:
+        thresholds = np.arange(0, 1.01, 0.01)
+        f1_scores = []
         
-        # Calculate comprehensive metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, y_pred_prob)
-        conf_matrix = confusion_matrix(y_test, y_pred)
+        for thr in thresholds:
+            y_pred_thr = (y_pred_prob > thr).astype(int)
+            f1_thr = f1_score(y_test, y_pred_thr)
+            f1_scores.append(f1_thr)
         
-        print(f"Test Accuracy: {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall: {recall:.4f}")
-        print(f"F1 Score: {f1:.4f}")
-        print(f"AUC: {auc:.4f}")
-        print("Confusion Matrix:")
-        print(conf_matrix)
+        best_idx = np.argmax(f1_scores)
+        optimal_threshold = thresholds[best_idx]
+        best_f1 = f1_scores[best_idx]
         
-        # Save the model
-        print("Saving initial model...")
-        model.save('deepfake_detector_model.h5')
-        print("Model saved as 'deepfake_detector_model.h5'")
+        print(f"Optimal threshold: {optimal_threshold:.2f} (F1: {best_f1:.4f})")
         
-        # Plot training history with more metrics
-        plt.figure(figsize=(15, 10))
+        # Save optimal threshold to file
+        with open('optimal_threshold.txt', 'w') as f:
+            f.write(str(optimal_threshold))
         
-        # Accuracy subplot
-        plt.subplot(2, 2, 1)
-        plt.plot(history.history['accuracy'])
-        plt.plot(history.history['val_accuracy'])
-        plt.title('Model Accuracy')
-        plt.ylabel('Accuracy')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Validation'], loc='upper left')
+        metrics['optimal_threshold'] = optimal_threshold
+    
+    return metrics
+
+def plot_training_history(history, fine_tuning_history=None):
+    """
+    Plot the training history
+    
+    Args:
+        history: Training history
+        fine_tuning_history: Fine-tuning history (optional)
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Plot accuracy
+    plt.subplot(2, 1, 1)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    
+    if fine_tuning_history is not None:
+        # Calculate the starting epoch for fine-tuning
+        ft_start = len(history.history['accuracy'])
+        ft_end = ft_start + len(fine_tuning_history.history['accuracy'])
+        ft_epochs = range(ft_start, ft_end)
         
-        # Loss subplot
-        plt.subplot(2, 2, 2)
-        plt.plot(history.history['loss'])
-        plt.plot(history.history['val_loss'])
-        plt.title('Model Loss')
-        plt.ylabel('Loss')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Validation'], loc='upper left')
+        plt.plot(ft_epochs, fine_tuning_history.history['accuracy'], label='Fine-Tuning Training Accuracy')
+        plt.plot(ft_epochs, fine_tuning_history.history['val_accuracy'], label='Fine-Tuning Validation Accuracy')
+    
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot loss
+    plt.subplot(2, 1, 2)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    
+    if fine_tuning_history is not None:
+        plt.plot(ft_epochs, fine_tuning_history.history['loss'], label='Fine-Tuning Training Loss')
+        plt.plot(ft_epochs, fine_tuning_history.history['val_loss'], label='Fine-Tuning Validation Loss')
+    
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png')
+    plt.close()
+
+def save_model_summary(model, file_path='model_summary.txt'):
+    """
+    Save the model summary to a file
+    
+    Args:
+        model: The model
+        file_path: Path to save the summary
+    """
+    with open(file_path, 'w') as f:
+        # Redirect stdout to the file
+        old_stdout = sys.stdout
+        sys.stdout = f
         
-        # AUC subplot
-        plt.subplot(2, 2, 3)
-        plt.plot(history.history['auc'])
-        plt.plot(history.history['val_auc'])
-        plt.title('Model AUC')
-        plt.ylabel('AUC')
-        plt.xlabel('Epoch')
-        plt.legend(['Train', 'Validation'], loc='upper left')
+        # Print the model summary
+        model.summary()
         
-        # Precision-Recall subplot
-        plt.subplot(2, 2, 4)
-        plt.plot(history.history['precision'])
-        plt.plot(history.history['recall'])
-        plt.plot(history.history['val_precision'])
-        plt.plot(history.history['val_recall'])
-        plt.title('Precision and Recall')
-        plt.ylabel('Score')
-        plt.xlabel('Epoch')
-        plt.legend(['Train Precision', 'Train Recall', 'Val Precision', 'Val Recall'], loc='upper left')
-        
-        plt.tight_layout()
-        plt.savefig('training_history.png')
-        print("Enhanced training history plot saved as 'training_history.png'")
-        
-        # Advanced fine-tuning strategy
-        print("Performing advanced fine-tuning with gradual unfreezing...")
-        
-        # Step 1: Unfreeze the top layers of the base model (last 50 layers)
-        for layer in model.layers[1].layers[-50:]:
-            layer.trainable = True
-            
-        # Recompile the model with a lower learning rate
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=5e-5),  # Lower learning rate
-            loss='binary_crossentropy',
-            metrics=[
-                'accuracy',
-                keras.metrics.AUC(name='auc'),
-                keras.metrics.Precision(name='precision'),
-                keras.metrics.Recall(name='recall')
-            ]
-        )
-        
-        # Train with unfrozen layers (first round)
-        print("Fine-tuning stage 1 - training with top 50 layers unfrozen...")
-        history_fine_tune1 = model.fit(
-            X_train,
-            y_train,
-            batch_size=BATCH_SIZE // 2,  # Smaller batch size for fine-tuning
-            epochs=10,
-            validation_data=(X_val, y_val),
-            callbacks=[early_stopping, reduce_lr, model_checkpoint],
-            class_weight=class_weight_dict
-        )
-        
-        # Step 2: Unfreeze all layers for final tuning
-        for layer in model.layers[1].layers:
-            layer.trainable = True
-            
-        # Recompile with even lower learning rate for final tuning
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-            loss='binary_crossentropy',
-            metrics=[
-                'accuracy',
-                keras.metrics.AUC(name='auc'),
-                keras.metrics.Precision(name='precision'),
-                keras.metrics.Recall(name='recall')
-            ]
-        )
-        
-        # Train with all layers unfrozen (final round)
-        print("Fine-tuning stage 2 - training with all layers unfrozen...")
-        history_fine_tune2 = model.fit(
-            X_train,
-            y_train,
-            batch_size=BATCH_SIZE // 4,  # Even smaller batch size
-            epochs=5,
-            validation_data=(X_val, y_val),
-            callbacks=[early_stopping, reduce_lr, model_checkpoint],
-            class_weight=class_weight_dict
-        )
-        
-        # Final evaluation on test set
-        print("Evaluating final fine-tuned model...")
-        y_pred_prob = model.predict(X_test)
-        y_pred = (y_pred_prob > 0.5).astype(int).flatten()
-        
-        # Calculate comprehensive metrics for fine-tuned model
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, y_pred_prob)
-        conf_matrix = confusion_matrix(y_test, y_pred)
-        
-        print(f"Fine-tuned Test Accuracy: {accuracy:.4f}")
-        print(f"Fine-tuned Precision: {precision:.4f}")
-        print(f"Fine-tuned Recall: {recall:.4f}")
-        print(f"Fine-tuned F1 Score: {f1:.4f}")
-        print(f"Fine-tuned AUC: {auc:.4f}")
-        print("Fine-tuned Confusion Matrix:")
-        print(conf_matrix)
-        
-        # Visualize confusion matrix
-        plt.figure(figsize=(8, 6))
-        labels = ['FAKE', 'REAL']
-        cm_display = confusion_matrix(y_test, y_pred)
-        plt.imshow(cm_display, interpolation='nearest', cmap=plt.cm.Blues)
-        plt.title('Confusion Matrix')
-        plt.colorbar()
-        tick_marks = np.arange(len(labels))
-        plt.xticks(tick_marks, labels)
-        plt.yticks(tick_marks, labels)
-        
-        # Add text annotations
-        thresh = cm_display.max() / 2.
-        for i in range(len(labels)):
-            for j in range(len(labels)):
-                plt.text(j, i, format(cm_display[i, j], 'd'),
-                        horizontalalignment="center",
-                        color="white" if cm_display[i, j] > thresh else "black")
-        
-        plt.tight_layout()
-        plt.ylabel('True label')
-        plt.xlabel('Predicted label')
-        plt.savefig('confusion_matrix.png')
-        
-        # Save the final fine-tuned model
-        model.save('deepfake_detector_model_fine_tuned.h5')
-        print("Fine-tuned model saved as 'deepfake_detector_model_fine_tuned.h5'")
-        
-        # Load the best model from checkpoints and save it as the final model
-        print("Loading best model from checkpoint...")
-        best_model = keras.models.load_model('deepfake_detector_best_model.h5')
-        best_model.save('deepfake_detector_model_best.h5')
-        print("Best model from training saved as 'deepfake_detector_model_best.h5'")
-        
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        import traceback
-        traceback.print_exc()  # Print detailed error information
+        # Restore stdout
+        sys.stdout = old_stdout
+
+def main():
+    """Main function to train and evaluate the deepfake detector model"""
+    print("=======================================")
+    print("DeepFake Detector - Training Pipeline")
+    print("=======================================")
+    
+    # Create face extraction pipeline
+    face_detector = create_face_extraction_pipeline()
+    
+    # Load the dataset
+    videos_df = load_dataset()
+    
+    # Split the dataset into training, validation, and test sets
+    train_df, val_df, test_df = create_train_val_test_split(videos_df)
+    
+    # Process videos and extract faces
+    print("\nProcessing training videos...")
+    X_train, y_train, _ = process_videos_and_extract_faces(train_df, face_detector, max_frames=30)
+    
+    print("\nProcessing validation videos...")
+    X_val, y_val, _ = process_videos_and_extract_faces(val_df, face_detector, max_frames=30)
+    
+    print("\nProcessing test videos...")
+    X_test, y_test, _ = process_videos_and_extract_faces(test_df, face_detector, max_frames=30)
+    
+    print("\nTraining and Validation Data:")
+    print(f"X_train shape: {X_train.shape}")
+    print(f"y_train shape: {y_train.shape}")
+    print(f"X_val shape: {X_val.shape}")
+    print(f"y_val shape: {y_val.shape}")
+    print(f"X_test shape: {X_test.shape}")
+    print(f"y_test shape: {y_test.shape}")
+    
+    # Balance the dataset if severely imbalanced
+    class_counts = np.bincount(y_train.astype(int))
+    print(f"Training class distribution: {class_counts}")
+    
+    # Train the initial model
+    print("\nTraining the initial model...")
+    model, history = train_model(X_train, y_train, X_val, y_val, freeze_base=True)
+    
+    # Save the initial model
+    model.save(MODEL_SAVE_PATH)
+    print(f"Initial model saved to {MODEL_SAVE_PATH}")
+    
+    # Evaluate the initial model
+    print("\nEvaluating the initial model...")
+    eval_metrics = evaluate_model(model, X_test, y_test)
+    
+    # Fine-tune the model
+    print("\nFine-tuning the model...")
+    fine_tuned_model, fine_tuning_history = fine_tune_model(model, X_train, y_train, X_val, y_val)
+    
+    # Save the fine-tuned model
+    fine_tuned_model.save(FINE_TUNED_MODEL_SAVE_PATH)
+    print(f"Fine-tuned model saved to {FINE_TUNED_MODEL_SAVE_PATH}")
+    
+    # Evaluate the fine-tuned model
+    print("\nEvaluating the fine-tuned model...")
+    eval_metrics_ft = evaluate_model(fine_tuned_model, X_test, y_test)
+    
+    # Plot the training history
+    plot_training_history(history, fine_tuning_history)
+    print("Training history plot saved to training_history.png")
+    
+    # Save the model summary
+    save_model_summary(fine_tuned_model)
+    print("Model summary saved to model_summary.txt")
+    
+    print("\n=======================================")
+    print("DeepFake Detection Training Completed")
+    print("=======================================")
 
 if __name__ == "__main__":
     main()
